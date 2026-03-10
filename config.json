@@ -1,0 +1,12 @@
+{
+  "recast_interval": 8,
+  "force_cpu": false,
+  "margin_x": 0.1,
+  "margin_y": 0.1,
+  "overlay": true,
+  "hotkeys": {
+    "toggle_input": "ctrl+x",
+    "exit": "ctrl+e"
+  }
+}
+
