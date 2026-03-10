@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 import time
+import math
 import win32gui
 import win32ui
 import win32con
@@ -72,13 +73,15 @@ DIFF_BUCKET_SIZE = 20         # px — group diffs into buckets for lookup
 LEARN_BASE_RATE = 0.025       # EMA base step (scaled by quality score)
 LEARN_COUNT_CAP = 300.0       # Float cap on bucket count (prevents entrenchment)
 LEARN_COUNT_DECAY = 0.997     # Per-session multiplier on all counts (~50% after 231 sessions)
+LEARN_SCHEMA_VERSION = 3      # v3: offset-based learning for MPC
+HUE_BOUNDARY_MARGIN = 3       # Treat near-boundary hues as unknown to avoid false locks
 
 def _default_tier():
     return {"sessions": 0, "avg_quality": 0.0, "hold_table": {}}
 
 def _default_learned_data():
     return {
-        "version": 2,
+        "version": LEARN_SCHEMA_VERSION,
         "total_sessions": 0,
         "tiers": {
             "slow":     _default_tier(),
@@ -96,8 +99,8 @@ def load_learned_data(path):
             data = json.load(f)
         if not isinstance(data, dict) or "tiers" not in data:
             return _default_learned_data()
-        if data.get("version") != 2:
-            print("[LEARN] Schema version mismatch — resetting to v2 (old data discarded)")
+        if data.get("version") != LEARN_SCHEMA_VERSION:
+            print(f"[LEARN] Schema version mismatch (got v{data.get('version')}, need v{LEARN_SCHEMA_VERSION}) — resetting (old data discarded)")
             return _default_learned_data()
         return data
     except Exception:
@@ -175,6 +178,12 @@ def classify_fish_rarity(hsv_med):
     h, s, v = int(hsv_med[0]), int(hsv_med[1]), int(hsv_med[2])
     if s < 50:
         return ("trash" if v < 110 else "abundant"), True
+    # Avoid unstable decisions near major class boundaries where anti-aliasing/noise flips rarity.
+    # Do not guard around 142 because purple/violet (H>=142) is a validated exotic band.
+    boundaries = (14, 40, 88, 132, 165)
+    for b in boundaries:
+        if abs(h - b) <= HUE_BOUNDARY_MARGIN:
+            return "unknown", False
     # Confirmed mappings (live sampling + hex codes):
     #   relic   = orange-red     (H=11 confirmed)
     #   fabled  = gold/yellow    (H ~12-40)
@@ -187,67 +196,61 @@ def classify_fish_rarity(hsv_med):
     if 40 <= h < 88:       return "common",  True   # bright green (confirmed)
     if 88 <= h < 132:      return "curious", True   # blue (confirmed at H=111)
     if 132 <= h < 142:     return "mythic",  True   # blue-purple (placeholder)
-    if 142 <= h < 165:     return "exotic",  True   # purple-violet (confirmed #af0fc2 ≈ H=147)
+    if 142 <= h < 165:     return "exotic",  True   # purple-violet (confirmed, includes H=142 edge)
     return "unknown", False  # unrecognised
 
 def get_diff_bucket(diff):
     return round(diff / DIFF_BUCKET_SIZE)
 
-def get_learned_hold(diff, speed_tier, learned_data, formula_hold):
-    """Blend learned hold time with formula hold using continuous alpha. Returns (hold, is_learned)."""
+def get_learned_hold(diff, speed_tier, learned_data, mpc_hold):
+    """Apply learned offset correction to MPC hold. Returns (hold, is_learned).
+    v3 schema: hold_table stores {"offset": float, "count": float} per bucket."""
     bucket = str(get_diff_bucket(diff))
     table = learned_data["tiers"].get(speed_tier, {}).get("hold_table", {})
     entry = table.get(bucket)
     if entry is None:
-        return formula_hold, False
-    learned = entry["hold"]
+        return mpc_hold, False
+    learned_offset = entry.get("offset", 0.0)
     count = float(entry.get("count", 0))
     # Continuous alpha: reaches ~0.75 at count=100, ~0.90 at count=300
     alpha = min(0.92, count / (count + 33.0)) if count > 0 else 0.0
-    blended = alpha * learned + (1.0 - alpha) * formula_hold
-    return max(MIN_HOLD, min(MAX_HOLD, blended)), True
+    corrected = mpc_hold + alpha * learned_offset
+    return max(MIN_HOLD, min(MAX_HOLD, corrected)), True
 
 def process_session_learning(session_frames, quality, speed_tier, learned_data):
-    """Update learned hold table from session frame data. Modifies learned_data in-place.
-    quality: float 0.0–1.0 (progress bar fill ratio for this session)."""
+    """Update learned offset table from session frame data. Modifies learned_data in-place.
+    quality: float 0.0–1.0 (progress bar fill ratio for this session).
+    v3: learns residual offsets (hold_used - mpc_hold) instead of absolute hold times."""
     tier = learned_data["tiers"].setdefault(speed_tier, _default_tier())
     tier["sessions"] += 1
-    # EMA of session quality (how well we tracked this tier over time)
     tier["avg_quality"] = tier.get("avg_quality", 0.0) * 0.9 + quality * 0.1
     learned_data["total_sessions"] += 1
-
     # Quality-gradient learning rate: 0.3x at quality=0, ramps to 2.0x at quality=1.0
     rate = LEARN_BASE_RATE * max(0.3, min(2.0, 0.3 + 1.7 * quality))
-
     table = tier.setdefault("hold_table", {})
-
-    # --- Step 1: aggregate session frames by bucket ---
-    bucket_data = {}  # bucket -> {hold_sum, speed_sum, count}
-    for diff_i, hold_i, speed_i, _formula_i in session_frames:
+    # --- Step 1: aggregate session frames by bucket (residual = hold_used - mpc_hold) ---
+    bucket_data = {}  # bucket -> {residual_sum, speed_sum, n}
+    for diff_i, hold_i, speed_i, mpc_i in session_frames:
         b = str(get_diff_bucket(diff_i))
         if b not in bucket_data:
-            bucket_data[b] = {"hold_sum": 0.0, "speed_sum": 0.0, "n": 0}
-        bucket_data[b]["hold_sum"] += hold_i
+            bucket_data[b] = {"residual_sum": 0.0, "speed_sum": 0.0, "n": 0}
+        bucket_data[b]["residual_sum"] += (hold_i - mpc_i)
         bucket_data[b]["speed_sum"] += speed_i
         bucket_data[b]["n"] += 1
-
-    # Compute tier-average fish speed for erratic-frame detection
+    # Tier-average fish speed for erratic-frame detection
     all_speeds = [s for _, _, s, _ in session_frames]
     tier_avg_speed = (sum(all_speeds) / len(all_speeds)) if all_speeds else 1.0
-
     # --- Step 2: apply count decay to ALL existing buckets ---
     for entry in table.values():
         entry["count"] = max(0.0, entry["count"] * LEARN_COUNT_DECAY)
-
-    # --- Step 3: EMA update for visited buckets ---
+    # --- Step 3: EMA update for visited buckets (offset-based) ---
     for b, bd in bucket_data.items():
-        avg_hold = bd["hold_sum"] / bd["n"]
+        avg_residual = bd["residual_sum"] / bd["n"]
         avg_speed = bd["speed_sum"] / bd["n"]
-        # Halve rate when fish was erratic in this bucket (unreliable signal)
         bucket_rate = rate * (0.5 if tier_avg_speed > 0 and avg_speed > 2.0 * tier_avg_speed else 1.0)
-        entry = table.get(b, {"hold": avg_hold, "count": 0.0})
-        old_hold = entry["hold"]
-        entry["hold"] = max(MIN_HOLD, min(MAX_HOLD, old_hold + bucket_rate * (avg_hold - old_hold)))
+        entry = table.get(b, {"offset": 0.0, "count": 0.0})
+        old_offset = entry.get("offset", 0.0)
+        entry["offset"] = old_offset + bucket_rate * (avg_residual - old_offset)
         entry["count"] = min(LEARN_COUNT_CAP, entry["count"] + 1.0)
         table[b] = entry
 
@@ -318,29 +321,80 @@ OVERLAY_ENABLED = bool(config.get("overlay", DEFAULT_CONFIG["overlay"]))
 DEBUG_COLOR_LOG = True      # Print [COLOR] each frame a fish is detected (calibration aid)
 
 # Control parameters
-CYCLE_TIME = 0.055          # Click cycle interval (~18Hz control rate, was 0.12)
+CYCLE_TIME = 0.055          # Click cycle interval (~18Hz control rate)
 DETECTION_CYCLE = 0.005    # Detection wait interval when not clicking
 SMOOTH_FACTOR = 0.5        # Coordinate smoothing factor
 
-# Hold timing
-BASE_HOLD = 0.035      # Neutral hold — equilibrium where bar neither rises nor falls
-GRAVITY_BIAS = 0.005   # Extra hold to offset bar's natural gravity sag (bar sinks if hold < BASE+bias)
-STEP_ADJUST = 0.06     # Kp: proportional gain
-D_GAIN = 0.008         # Kd: derivative gain — damps overshoot via measured bar velocity
+# Hold timing — MPC computes hold dynamically; these are safety clamps & fallback
 MAX_HOLD = 0.08
 MIN_HOLD = 0.02
-CENTER_ZONE_RATIO = 0.25  # Fraction of bar_half_height that counts as "well centered"
-UP_COUNTER_HOLD = 0.02
-DOWN_COUNTER_HOLD = 0.08
+UP_COUNTER_HOLD = 0.02    # Emergency brake: bar rising too fast
+DOWN_COUNTER_HOLD = 0.08  # Emergency brake: bar falling too fast
 JITTER_PIXELS = 4          # Small mouse jitter amplitude (px)
 
+# PD fallback constants — used before MPC calibration converges
+PD_BASE_HOLD = 0.035       # Neutral hold for PD fallback
+PD_GRAVITY_BIAS = 0.005
+PD_STEP_ADJUST = 0.06      # Kp
+PD_D_GAIN = 0.008          # Kd
+
+# MPC constants — game physics: gravity=1.25, playerSpeed=3.75, ratio=3.0
+PHYSICS_SPEED_GRAVITY_RATIO = 3.0   # playerSpeed / gravity (from UdonSharp)
+MPC_MIN_CALIBRATION = 20            # Min samples before MPC replaces PD fallback
+MPC_FISH_PREDICT = 0.5              # Fraction of cycle to predict fish position ahead
+MPC_CALIB_EMA = 0.05                # EMA rate for gravity estimation
+MPC_CALIB_DENOM_MIN = 0.005         # Min denominator to accept calibration sample
+MPC_CALIB_OUTLIER = 5.0             # Reject sample if > N× current estimate
+
+# Fight phase timing
+GRACE_DURATION = 1.0       # 0-1s: zero escape penalty (game fact)
+RAMP_END = 5.0             # 1-5s: penalty ramps linearly
+CATCH_ZONE_FRACTION = 0.35 # Conservative overlap estimate (game: 0.4-0.65 of bar)
+
+# Edge/bounce handling
+EDGE_MARGIN_RATIO = 0.10   # % of bar range considered "near wall"
+
 # Thresholds
-BOOST_THRESHOLD = 80       # Boost distance threshold (px)
-SPEED_THRESHOLD = 70       # Brake speed threshold
-CAUGHT_THRESHOLD = 0.3     # Progress bar fill ratio to classify as "caught"
+SPEED_THRESHOLD = 120      # Emergency brake speed threshold (px/s) — raised for MPC
+CAUGHT_THRESHOLD = 0.2     # Progress bar fill ratio to classify as "caught" (robust to bar-scale mismatch)
 FISH_CONF_MIN = 0.25       # Minimum confidence to accept a 'fish icon' detection
 RECAST_INTERVAL = float(config.get("recast_interval", DEFAULT_CONFIG["recast_interval"]))  # Seconds before recast
 LOST_TRACK_THRESHOLD = 1.5 # Grace period for keeping last coordinates
+
+def compute_mpc_hold(bar_pos, bar_vel, fish_pos, cycle_time, pg, ps):
+    """Compute optimal hold time to move bar to fish position in one cycle.
+    All values in pixel coordinates (y increases downward).
+    Game physics in pixel-space:
+      Gravity pulls bar DOWN (+y): accel = +pg
+      Clicking pushes bar UP (-y): accel = -ps
+    One-cycle prediction:
+      p1 = p0 + v0*T + 0.5*pg*T^2 - ps*Th*(T - 0.5*Th)
+    bar_pos/fish_pos in pixels, bar_vel in px/s, pg/ps in px/s^2 (positive)."""
+    T = cycle_time
+    # Position the bar would reach with zero click (gravity only, bar falls down)
+    p_freefall = bar_pos + bar_vel * T + 0.5 * pg * T * T
+    # How much upward displacement we need from clicking (negative = need to go up)
+    need = fish_pos - p_freefall  # negative = fish is above freefall → need click
+    # Full equation: p1 = p_freefall - ps*Th*(T - 0.5*Th) = fish_pos
+    # → ps*Th*(T - 0.5*Th) = -need = p_freefall - fish_pos
+    # → 0.5*ps*Th^2 - ps*T*Th + (p_freefall - fish_pos) = 0
+    c = p_freefall - fish_pos  # positive = freefall overshoots downward, need more click
+    # Quadratic: 0.5*ps*Th^2 - ps*T*Th + c = 0
+    disc = ps * ps * T * T - 2.0 * ps * c
+    if disc < 0:
+        # Can't reach target in one cycle — clamp to boundary
+        return MAX_HOLD if c > 0 else MIN_HOLD
+    sqrt_disc = math.sqrt(disc)
+    th1 = T - sqrt_disc / ps
+    th2 = T + sqrt_disc / ps
+    # Pick the solution in [0, T]; prefer th1 (shorter click = less aggressive)
+    if 0.0 <= th1 <= T:
+        th = th1
+    elif 0.0 <= th2 <= T:
+        th = th2
+    else:
+        th = max(0.0, min(T, th1))
+    return max(MIN_HOLD, min(MAX_HOLD, th))
 
 # Hotkey settings
 hotkeys_cfg = config.get("hotkeys", {})
@@ -363,11 +417,23 @@ session_frames = []    # Per-frame (diff, hold_time, fish_speed) for learning
 current_speed_tier = "medium"   # Running speed tier classification
 current_fish_rarity = "unknown" # Last detected fish rarity (from color)
 _rarity_vote_buffer = []        # Multi-frame voting buffer (up to 5 recent rarity samples)
-hold_source = "F"               # "L" = learned, "F" = formula (for overlay)
+hold_source = "F"               # "L" = learned, "F" = formula/MPC (for overlay)
 last_known_progress = 0.0  # Progress bar fill ratio (0.0-1.0)
+session_peak_progress = 0.0  # Peak progress seen this fishing session
 fish_caught = 0            # Total caught count
 fish_escaped = 0           # Total escaped count
 bar_half_height = None     # Half the white bar height (px), smoothed
+# MPC calibration state
+est_pixel_gravity = None   # Estimated gravity in px/s^2 (auto-calibrated)
+est_pixel_player_speed = None  # = 3.0 * est_pixel_gravity
+calibration_count = 0      # Number of accepted calibration samples
+prev_hold_time = 0.0       # Hold time used in previous cycle (for calibration)
+prev_bar_v = 0.0           # Bar velocity from previous cycle
+fight_start_time = 0.0     # Timestamp when current fight began
+# Edge tracking
+session_bar_min = None     # Min bar_cy observed this fight (proxy for top wall)
+session_bar_max = None     # Max bar_cy observed this fight (proxy for bottom wall)
+bounce_skip = False        # Skip calibration sample after detected bounce
 bar_v = 0.0                # Bar vertical velocity (px/s), positive = moving down
 
 # Self-learning data
@@ -437,8 +503,11 @@ def toggle_input():
 def recapture_window():
     global locked_hwnd, last_detected_time, last_fish_cy, last_bar_cy, prev_bar_cy
     global fish_lost_at, bar_lost_at, prev_diff, was_fishing, jitter_done
-    global prev_fish_cy, session_frames, last_known_progress, bar_half_height
+    global prev_fish_cy, session_frames, last_known_progress, session_peak_progress, bar_half_height
     global current_fish_rarity, current_speed_tier, _rarity_vote_buffer
+    global est_pixel_gravity, est_pixel_player_speed, calibration_count
+    global prev_hold_time, prev_bar_v, fight_start_time
+    global session_bar_min, session_bar_max, bounce_skip
     locked_hwnd = None
     last_detected_time = time.time()
     last_fish_cy = last_bar_cy = prev_bar_cy = None
@@ -447,10 +516,20 @@ def recapture_window():
     prev_fish_cy = None
     session_frames = []
     last_known_progress = 0.0
+    session_peak_progress = 0.0
     bar_half_height = None
     current_fish_rarity = "unknown"
     current_speed_tier = "medium"
     _rarity_vote_buffer = []
+    est_pixel_gravity = None
+    est_pixel_player_speed = None
+    calibration_count = 0
+    prev_hold_time = 0.0
+    prev_bar_v = 0.0
+    fight_start_time = 0.0
+    session_bar_min = None
+    session_bar_max = None
+    bounce_skip = False
     if was_fishing:
         was_fishing = False
     print(f"--- RECAPTURE: Scanning for focused {WINDOW_NAME} window ---")
@@ -545,11 +624,18 @@ while True:
                     if current_fish_rarity == "unknown":
                         if known:
                             _rarity_vote_buffer.append(rarity)
-                            if len(_rarity_vote_buffer) > 5:
+                            if len(_rarity_vote_buffer) > 7:
                                 _rarity_vote_buffer.pop(0)
-                            recent = _rarity_vote_buffer[-3:]
-                            if len(recent) >= 2 and recent.count(recent[-1]) >= 2:
-                                current_fish_rarity = recent[-1]
+                            recent = _rarity_vote_buffer[-5:]
+                            counts = {}
+                            for r in recent:
+                                counts[r] = counts.get(r, 0) + 1
+                            sorted_counts = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)
+                            top_label, top_count = sorted_counts[0]
+                            second_count = sorted_counts[1][1] if len(sorted_counts) > 1 else 0
+                            # Stronger lock: 4-of-5 majority with margin over runner-up.
+                            if len(recent) >= 5 and top_count >= 4 and (top_count - second_count) >= 2:
+                                current_fish_rarity = top_label
                                 current_speed_tier = RARITY_TO_TIER.get(current_fish_rarity, "medium")
                         else:
                             print(f"[RARITY] Unknown | {_cname} (H={hsv_med[0]} S={hsv_med[1]} V={hsv_med[2]}) — please report!")
@@ -580,11 +666,22 @@ while True:
 
     # Track that a fishing session is active
     if last_bar_cy is not None and last_fish_cy is not None:
+        if not was_fishing:
+            fight_start_time = current_time  # Mark start of new fight
+            session_bar_min = last_bar_cy
+            session_bar_max = last_bar_cy
         was_fishing = True
+        # Update edge tracking for bounce detection
+        if session_bar_min is None or last_bar_cy < session_bar_min:
+            session_bar_min = last_bar_cy
+        if session_bar_max is None or last_bar_cy > session_bar_max:
+            session_bar_max = last_bar_cy
         # Update progress bar tracking
         progress = detect_progress_bar(full_frame, x_start, y_start, x_end, y_end)
         if progress is not None:
             last_known_progress = progress
+            if progress > session_peak_progress:
+                session_peak_progress = progress
 
     # Update and retain fish coordinates.
     if current_fish_cy_raw is not None:
@@ -598,8 +695,10 @@ while True:
             jitter_direction = -jitter_direction  # Flip for next fish
         # Track fish speed for learning (px/s between consecutive fish detections)
         fish_speed = 0.0
+        fish_vel_signed = 0.0  # Signed velocity for MPC fish prediction
         if prev_fish_cy is not None and dt > 0:
             fish_speed = abs(current_fish_cy_raw - prev_fish_cy) / dt
+            fish_vel_signed = (current_fish_cy_raw - prev_fish_cy) / dt
         prev_fish_cy = current_fish_cy_raw
         last_fish_cy, last_detected_time, fish_lost_at = current_fish_cy_raw, current_time, 0
     else:
@@ -609,53 +708,138 @@ while True:
             last_fish_cy = None
             jitter_done = False  # Allow jitter again on next fish
 
+    # --- Physics auto-calibration (Phase 2) ---
+    # Estimate pixel-space gravity from observed bar acceleration.
+    # In pixel coords (y↓): delta_v = g_px * (T - 3*Th)  [since s_px = 3*g_px]
+    # Solving: g_px = delta_v / (T - 3*Th)
+    if (all_bar_y_coords and was_fishing and prev_hold_time > 0
+            and dt > 0 and not bounce_skip):
+        delta_v = bar_v - prev_bar_v
+        calib_denom = dt - PHYSICS_SPEED_GRAVITY_RATIO * prev_hold_time
+        if abs(calib_denom) > MPC_CALIB_DENOM_MIN:
+            sample = delta_v / calib_denom
+            if sample > 0:  # gravity must be positive (downward in pixels)
+                if est_pixel_gravity is None:
+                    est_pixel_gravity = sample
+                    est_pixel_player_speed = PHYSICS_SPEED_GRAVITY_RATIO * sample
+                    calibration_count = 1
+                elif abs(sample) < MPC_CALIB_OUTLIER * est_pixel_gravity:
+                    est_pixel_gravity += MPC_CALIB_EMA * (sample - est_pixel_gravity)
+                    est_pixel_player_speed = PHYSICS_SPEED_GRAVITY_RATIO * est_pixel_gravity
+                    calibration_count += 1
+    bounce_skip = False  # Reset after one skipped sample
+
+    # --- Bounce detection (Phase 5) ---
+    # Bar velocity sign flip with ~70% magnitude drop = wall bounce
+    # Must check BEFORE updating prev_bar_v so we compare old vs new velocity
+    if (all_bar_y_coords and prev_bar_v != 0 and bar_v != 0
+            and (prev_bar_v > 0) != (bar_v > 0)
+            and abs(bar_v) < 0.5 * abs(prev_bar_v)):
+        bounce_skip = True  # Skip next calibration sample (bounce corrupts it)
+
+    prev_bar_v = bar_v
+    prev_hold_time = hold_time  # Will be used next cycle for calibration
+
+    # Determine fight phase
+    fight_elapsed = current_time - fight_start_time if was_fishing else 0.0
+    if fight_elapsed < GRACE_DURATION:
+        fight_phase = "GRACE"
+    elif fight_elapsed < RAMP_END:
+        fight_phase = "RAMP"
+    else:
+        fight_phase = "CRITICAL"
+
+    # Use MPC if calibrated, else PD fallback
+    mpc_ready = calibration_count >= MPC_MIN_CALIBRATION and est_pixel_gravity is not None
+
     # Control logic.
     if last_bar_cy is not None and last_fish_cy is not None:
         diff = last_fish_cy - last_bar_cy
         fish_visible = current_fish_cy_raw is not None
-        formula_hold = BASE_HOLD  # default; overwritten by PD branch below
+        bh = bar_half_height if bar_half_height and bar_half_height > 0 else 50
+        # Equilibrium hold (duty cycle = 1/3 of cycle) — used for centered/grace
+        equil_hold = max(MIN_HOLD, min(MAX_HOLD, CYCLE_TIME / PHYSICS_SPEED_GRAVITY_RATIO))
+        mpc_hold = equil_hold  # default; overwritten by MPC/PD below
+        hold_source = "F"  # default source label
 
         if fish_visible:
-            # Fish is actively detected — velocity-based brake only
+            # --- Emergency brakes (extreme velocity) ---
             if all_bar_y_coords and bar_v < -SPEED_THRESHOLD:
                 status, hold_time, color = "!! UP-BRAKE !!", UP_COUNTER_HOLD, (255, 255, 255)
             elif all_bar_y_coords and bar_v > SPEED_THRESHOLD:
                 status, hold_time, color = "!! DOWN-BRAKE !!", DOWN_COUNTER_HOLD, (255, 50, 50)
             else:
-                bh = bar_half_height if bar_half_height and bar_half_height > 0 else 50
-                # Use actual current diff — higher update rate means we sample fast enough
-                # to react to real position rather than needing feed-forward prediction.
-                nd = max(-2.0, min(2.0, diff / bh))
-                is_boost = abs(nd) > 1.0
-                is_centered = abs(nd) < CENTER_ZONE_RATIO
-                # D-term: measured bar velocity damps overshoot.
-                # bar_v > 0 = falling → add hold; bar_v < 0 = rising → ease off.
-                bv_norm = max(-1.0, min(1.0, bar_v / 200.0))
-                # PD + gravity bias
-                formula_hold = max(MIN_HOLD, min(MAX_HOLD,
-                    (BASE_HOLD + GRAVITY_BIAS) - STEP_ADJUST * nd + D_GAIN * bv_norm))
-                hold_time, is_learned = get_learned_hold(diff, current_speed_tier, learned_data, formula_hold)
-                hold_source = "L" if is_learned else "F"
-                if is_centered:
-                    status, color = "CENTERED", (0, 255, 100)
-                elif nd < 0:
-                    status, color = ("BOOST-UP" if is_boost else "ASCENDING"), (0, 255, 255)
-                else:
-                    status, color = ("BOOST-DOWN" if is_boost else "DESCENDING"), (255, 200, 0)
-            prev_diff = diff  # Only update when fish is real to avoid false brake on re-detection
-            # Record frame for learning (only when fish is visible and we have speed data)
+                # --- Edge override (Phase 5) ---
+                near_edge_override = False
+                if session_bar_min is not None and session_bar_max is not None:
+                    bar_range = session_bar_max - session_bar_min
+                    if bar_range > 20:  # Need meaningful range
+                        edge_margin = bar_range * EDGE_MARGIN_RATIO
+                        if last_bar_cy < session_bar_min + edge_margin and bar_v < -20:
+                            # Near top wall, moving up — let gravity pull down
+                            status, hold_time, color = "EDGE-TOP", MIN_HOLD, (200, 200, 255)
+                            near_edge_override = True
+                        elif last_bar_cy > session_bar_max - edge_margin and bar_v > 20:
+                            # Near bottom wall, moving down — push up hard
+                            status, hold_time, color = "EDGE-BOT", MAX_HOLD, (255, 200, 200)
+                            near_edge_override = True
+
+                if not near_edge_override:
+                    nd = max(-2.0, min(2.0, diff / bh))
+                    is_boost = abs(nd) > 1.0
+                    # Catch zone check (generous overlap from game physics)
+                    catch_zone_half = bh * CATCH_ZONE_FRACTION
+                    in_catch_zone = abs(diff) < catch_zone_half
+
+                    if mpc_ready:
+                        # --- MPC controller (Phase 3) ---
+                        # Predict fish position half-cycle ahead using measured velocity
+                        predict_frac = MPC_FISH_PREDICT
+                        if fight_phase == "CRITICAL":
+                            predict_frac *= 0.5  # Conservative in critical phase
+                        fish_target = last_fish_cy + fish_vel_signed * CYCLE_TIME * predict_frac
+                        mpc_hold = compute_mpc_hold(
+                            last_bar_cy, bar_v, fish_target,
+                            CYCLE_TIME, est_pixel_gravity, est_pixel_player_speed)
+                        hold_source = "M"  # MPC
+                    else:
+                        # --- PD fallback (pre-calibration) ---
+                        bv_norm = max(-1.0, min(1.0, bar_v / 200.0))
+                        mpc_hold = max(MIN_HOLD, min(MAX_HOLD,
+                            (PD_BASE_HOLD + PD_GRAVITY_BIAS) - PD_STEP_ADJUST * nd + PD_D_GAIN * bv_norm))
+                        hold_source = "P"  # PD fallback
+
+                    # Grace phase: relax if already in catch zone
+                    if fight_phase == "GRACE" and in_catch_zone:
+                        hold_time = equil_hold
+                        hold_source = "G"  # Grace
+                    else:
+                        hold_time, is_learned = get_learned_hold(
+                            diff, current_speed_tier, learned_data, mpc_hold)
+                        if is_learned:
+                            hold_source = "L"  # Learned offset
+
+                    if in_catch_zone:
+                        status, color = "CENTERED", (0, 255, 100)
+                    elif nd < 0:
+                        status, color = ("BOOST-UP" if is_boost else "ASCENDING"), (0, 255, 255)
+                    else:
+                        status, color = ("BOOST-DOWN" if is_boost else "DESCENDING"), (255, 200, 0)
+
+            prev_diff = diff
+            # Record frame for learning (residual = hold_used - mpc_hold)
             if current_fish_cy_raw is not None:
-                session_frames.append((diff, hold_time, fish_speed, formula_hold))
+                session_frames.append((diff, hold_time, fish_speed, mpc_hold))
         else:
-            # Fish is hidden (inside bar) — skip all velocity/brake logic to prevent wild swings.
-            # Use a neutral hold based only on last known position sign.
+            # Fish is hidden (inside bar) — use equilibrium hold
             if diff < 0:
-                status, hold_time, color = "HOLDING-UP", BASE_HOLD, (0, 180, 180)
+                status, hold_time, color = "HOLDING-UP", equil_hold, (0, 180, 180)
             else:
-                status, hold_time, color = "HOLDING-DOWN", BASE_HOLD, (180, 140, 0)
-            # prev_diff intentionally NOT updated — avoids false brake trigger when fish reappears
+                status, hold_time, color = "HOLDING-DOWN", equil_hold, (180, 140, 0)
 
         if not all_bar_y_coords: status += " (BAR LOST)"
+        # Append fight phase + elapsed time
+        phase_tag = f" {fight_phase} {fight_elapsed:.1f}s" if was_fishing else ""
 
         if input_enabled:
             lParam = win32api.MAKELONG(w // 2, h // 2)
@@ -666,7 +850,8 @@ while True:
         else:
             time.sleep(hold_time)
         
-        debug_text = f"{status} | HOLD: {hold_time:.3f} [{hold_source}]"
+        calib_tag = f" g={est_pixel_gravity:.0f}" if est_pixel_gravity else " g=?"
+        debug_text = f"{status} | HOLD: {hold_time:.3f} [{hold_source}]{calib_tag}{phase_tag}"
         if OVERLAY_ENABLED:
             cv2.line(full_frame, (15, int(last_bar_cy)), (15, int(last_fish_cy)), color, 2)
 
@@ -674,7 +859,9 @@ while True:
     elif current_time - last_detected_time > RECAST_INTERVAL:
         if was_fishing:
             sessions_total += 1
-            caught = last_known_progress >= CAUGHT_THRESHOLD
+            # Use peak session progress to avoid late-frame dropouts marking real catches as misses.
+            effective_progress = max(last_known_progress, session_peak_progress)
+            caught = effective_progress >= CAUGHT_THRESHOLD
             if caught:
                 fish_caught += 1
             else:
@@ -682,22 +869,26 @@ while True:
             outcome = "CATCH" if caught else "MISS"
             # --- Self-learning: update hold table from this session ---
             if len(session_frames) >= 5:
-                process_session_learning(session_frames, last_known_progress, current_speed_tier, learned_data)
+                process_session_learning(session_frames, effective_progress, current_speed_tier, learned_data)
                 save_learned_data(learned_data, LEARN_FILE)
                 tier_d = learned_data["tiers"].get(current_speed_tier, {})
                 avg_q = tier_d.get("avg_quality", 0.0)
                 tier_sessions = tier_d.get("sessions", 1)
-                print(f"[{outcome}] Session #{sessions_total} | Progress: {last_known_progress:.0%} | "
+                print(f"[{outcome}] Session #{sessions_total} | Progress: {effective_progress:.0%} (last {last_known_progress:.0%}, peak {session_peak_progress:.0%}) | "
                       f"Rarity={current_fish_rarity} ({current_speed_tier}) | "
                       f"{len(session_frames)} frames | Tier avg quality: {avg_q:.0%} over {tier_sessions}s")
             else:
-                print(f"[{outcome}] Session #{sessions_total} | Progress: {last_known_progress:.0%} | "
+                print(f"[{outcome}] Session #{sessions_total} | Progress: {effective_progress:.0%} (last {last_known_progress:.0%}, peak {session_peak_progress:.0%}) | "
                       f"Rarity={current_fish_rarity} (insufficient frames, not learned)")
             session_frames = []
             was_fishing = False
             last_known_progress = 0.0
+            session_peak_progress = 0.0
             current_fish_rarity = "unknown"
             _rarity_vote_buffer[:] = []
+            session_bar_min = None
+            session_bar_max = None
+            fight_start_time = 0.0
         if input_enabled:
             lParam = win32api.MAKELONG(w // 2, h // 2)
             win32gui.SendMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, lParam)
