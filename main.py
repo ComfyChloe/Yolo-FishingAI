@@ -180,24 +180,23 @@ def classify_fish_rarity(hsv_med):
     if s < 50:
         return ("trash" if v < 110 else "abundant"), True
     # Avoid unstable decisions near major class boundaries where anti-aliasing/noise flips rarity.
+    # Do not guard around 14 (relic/fabled) — both sides confirmed by live data.
     # Do not guard around 142 because purple/violet (H>=142) is a validated exotic band.
-    boundaries = (14, 88, 132, 165)
+    boundaries = (88, 132, 165)
     for b in boundaries:
         if abs(h - b) <= HUE_BOUNDARY_MARGIN:
             return "unknown", False
     # Confirmed mappings (live sampling + hex codes):
-    #   relic   = brown/dark-red  (low-saturation red, S<140)
-    #   fabled  = gold/yellow    (H ~12-40)
-    #   common  = bright green   (H ~40-88)
-    #   curious = blue #201f42   (H=111 confirmed)
-    #   exotic  = purple #af0fc2 (H=147 confirmed)
-    # Unconfirmed: elusive, mythic, saturated-red — will print [RARITY] unknown to calibrate
-    if h < 14 or h >= 165:
-        # High saturation red (S>=140) is NOT relic — unidentified fast rarity
-        if s >= 140:
-            return "unknown", False
-        return "relic", True  # brown/low-sat red
-    if 14 <= h < 40:       return "fabled",  True   # gold/yellow (confirmed)
+    #   unknown = true red  H=0-10, S>=140 (fast/aggressive, unidentified rarity)
+    #   relic   = orange-brown H=11-13, S~180 (slow, confirmed)
+    #   fabled  = gold/yellow  H ~14-40 (confirmed)
+    #   common  = bright green H ~40-88 (confirmed)
+    #   curious = blue         H=111 confirmed
+    #   exotic  = purple       H=147 confirmed
+    # Unconfirmed: elusive, mythic — will print [RARITY] unknown to calibrate
+    if h < 11 and s >= 140:    return "unknown", False  # bright red — unidentified fast fish
+    if h < 14 or h >= 165:     return "relic",   True   # orange-brown (confirmed H=11-13)
+    if 14 <= h < 40:           return "fabled",  True   # gold/yellow (confirmed)
     if 40 <= h < 88:       return "common",  True   # bright green (confirmed)
     if 88 <= h < 132:      return "curious", True   # blue (confirmed at H=111)
     if 132 <= h < 142:     return "mythic",  True   # blue-purple (placeholder)
