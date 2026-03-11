@@ -14,6 +14,24 @@ import json
 import torch
 from ultralytics import YOLO
 
+# ── Log file (wiped on every startup) ──────────────────────────────────────────
+class _Tee:
+    """Mirrors all print() output to both stdout and a log file."""
+    def __init__(self, path):
+        self._log = open(path, 'w', encoding='utf-8', buffering=1)
+        self._stdout = sys.stdout
+    def write(self, msg):
+        self._stdout.write(msg)
+        self._log.write(msg)
+    def flush(self):
+        self._stdout.flush()
+        self._log.flush()
+    def close(self):
+        self._log.close()
+
+_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fishing_log.txt')
+sys.stdout = _Tee(_LOG_PATH)
+
 # Window capture helper (supports background capture)
 def capture_window(hwnd):
     rect = win32gui.GetClientRect(hwnd)
@@ -39,44 +57,6 @@ def capture_window(hwnd):
         return None
     return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
-
-def detect_progress_bar(frame, x_start, y_start, x_end, y_end):
-    """Detect green progress bar fill in the left portion of the fishing ROI.
-    Returns fill ratio 0.0-1.0 (bottom-up fill), or None if not found."""
-    roi_width = x_end - x_start
-    search_end = x_start + int(roi_width * 0.5)
-    region = frame[y_start:y_end, x_start:search_end]
-    if region.size == 0:
-        return None
-    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, (30, 55, 55), (100, 255, 255))
-    col_sums = mask.sum(axis=0) // 255
-    if col_sums.max() < 8:
-        return None
-    peak_col = int(col_sums.argmax())
-    col_lo = max(0, peak_col - 5)
-    col_hi = min(mask.shape[1], peak_col + 6)
-    strip = mask[:, col_lo:col_hi]
-    row_hits = strip.max(axis=1)
-    green_rows = np.where(row_hits > 0)[0]
-    if len(green_rows) < 5:
-        return None
-    # Use the bottom contiguous green run; the bar fills bottom-up and scattered top noise
-    # should not count as real progress.
-    last_row = int(green_rows[-1])
-    first_row = last_row
-    gap_budget = 2
-    for row in range(last_row - 1, -1, -1):
-        if row_hits[row] > 0:
-            first_row = row
-            gap_budget = 2
-        else:
-            gap_budget -= 1
-            if gap_budget < 0:
-                break
-    green_height = last_row - first_row + 1
-    roi_height = y_end - y_start
-    return min(1.0, max(0.0, green_height / roi_height))
 
 
 # ======================
@@ -136,7 +116,7 @@ RARITY_TO_TIER = {
     "curious":  "medium",
     "elusive":  "medium",
     "fabled":   "fast",
-    "relic":    "fast",
+    "relic":    "slow",
     "mythic":   "veryfast",
     "exotic":   "veryfast",
     "unknown":  "medium",   # fallback — logged to console for identification
@@ -185,7 +165,7 @@ def _hue_name(h, s, v):
     """Human-readable color description for debug logs."""
     if s < 50:
         return "white/gray" if v >= 110 else "black/dark"
-    if h < 14 or h >= 165: return "red/orange-red"
+    if h < 14 or h >= 165: return "brown/dark-red" if v < 170 else "red/orange-red"
     if h < 25:  return "orange"
     if h < 40:  return "yellow/gold"
     if h < 88:  return "green"
@@ -206,13 +186,17 @@ def classify_fish_rarity(hsv_med):
         if abs(h - b) <= HUE_BOUNDARY_MARGIN:
             return "unknown", False
     # Confirmed mappings (live sampling + hex codes):
-    #   relic   = orange-red     (H=11 confirmed)
+    #   relic   = brown/dark-red  (low-saturation red, S<140)
     #   fabled  = gold/yellow    (H ~12-40)
     #   common  = bright green   (H ~40-88)
     #   curious = blue #201f42   (H=111 confirmed)
     #   exotic  = purple #af0fc2 (H=147 confirmed)
-    # Unconfirmed: elusive, mythic — will print [RARITY] unknown to calibrate
-    if h < 14 or h >= 165: return "relic",   True   # orange-red (confirmed at H=11)
+    # Unconfirmed: elusive, mythic, saturated-red — will print [RARITY] unknown to calibrate
+    if h < 14 or h >= 165:
+        # High saturation red (S>=140) is NOT relic — unidentified fast rarity
+        if s >= 140:
+            return "unknown", False
+        return "relic", True  # brown/low-sat red
     if 14 <= h < 40:       return "fabled",  True   # gold/yellow (confirmed)
     if 40 <= h < 88:       return "common",  True   # bright green (confirmed)
     if 88 <= h < 132:      return "curious", True   # blue (confirmed at H=111)
@@ -238,16 +222,13 @@ def get_learned_hold(diff, speed_tier, learned_data, mpc_hold):
     corrected = mpc_hold + alpha * learned_offset
     return max(MIN_HOLD, min(MAX_HOLD, corrected)), True
 
-def process_session_learning(session_frames, quality, speed_tier, learned_data):
+def process_session_learning(session_frames, speed_tier, learned_data):
     """Update learned offset table from session frame data. Modifies learned_data in-place.
-    quality: float 0.0–1.0 (progress bar fill ratio for this session).
     v3: learns residual offsets (hold_used - mpc_hold) instead of absolute hold times."""
     tier = learned_data["tiers"].setdefault(speed_tier, _default_tier())
     tier["sessions"] += 1
-    tier["avg_quality"] = tier.get("avg_quality", 0.0) * 0.9 + quality * 0.1
     learned_data["total_sessions"] += 1
-    # Quality-gradient learning rate: 0.3x at quality=0, ramps to 2.0x at quality=1.0
-    rate = LEARN_BASE_RATE * max(0.3, min(2.0, 0.3 + 1.7 * quality))
+    rate = LEARN_BASE_RATE
     table = tier.setdefault("hold_table", {})
     # --- Step 1: aggregate session frames by bucket (residual = hold_used - mpc_hold) ---
     bucket_data = {}  # bucket -> {residual_sum, speed_sum, n}
@@ -374,8 +355,7 @@ FAST_PREDICT_SCALE = 0.70           # Reduce prediction on fast/veryfast fish
 FAST_DAMP_SPEED_SCALE = 0.70        # Start damping earlier on fast/veryfast fish
 FAST_EQUIL_BLEND = 0.78             # Stronger equilibrium blend for jumpy fish
 FAST_SLEW_MAX = 0.014               # Tighter slew limit for fast/veryfast fish
-QUALITY_CATCH_RATIO = 0.62          # Fallback catch threshold from in-zone frame ratio
-QUALITY_MIN_FRAMES = 20             # Min visible frames before using quality fallback
+
 
 # Fight phase timing
 GRACE_DURATION = 1.0       # 0-1s: zero escape penalty (game fact)
@@ -387,7 +367,7 @@ EDGE_MARGIN_RATIO = 0.10   # % of bar range considered "near wall"
 
 # Thresholds
 SPEED_THRESHOLD = 120      # Emergency brake speed threshold (px/s) — raised for MPC
-CAUGHT_THRESHOLD = 0.2     # Progress bar fill ratio to classify as "caught" (robust to bar-scale mismatch)
+
 FISH_CONF_MIN = 0.25       # Minimum confidence to accept a 'fish icon' detection
 RECAST_INTERVAL = float(config.get("recast_interval", DEFAULT_CONFIG["recast_interval"]))  # Seconds before recast
 LOST_TRACK_THRESHOLD = 1.5 # Grace period for keeping last coordinates
@@ -449,12 +429,7 @@ current_speed_tier = "medium"   # Running speed tier classification
 current_fish_rarity = "unknown" # Last detected fish rarity (from color)
 _rarity_vote_buffer = []        # Multi-frame voting buffer (up to 5 recent rarity samples)
 hold_source = "F"               # "L" = learned, "F" = formula/MPC (for overlay)
-last_known_progress = 0.0  # Progress bar fill ratio (0.0-1.0)
-session_peak_progress = 0.0  # Peak progress seen this fishing session
-session_in_zone_frames = 0   # Frames where fish was inside catch zone
-session_visible_frames = 0   # Frames where fish was visible+tracked
-fish_caught = 0            # Total caught count
-fish_escaped = 0           # Total escaped count
+
 bar_half_height = None     # Half the white bar height (px), smoothed
 # MPC calibration state
 est_pixel_gravity = None   # Estimated gravity in px/s^2 (auto-calibrated)
@@ -537,8 +512,7 @@ def toggle_input():
 def recapture_window():
     global locked_hwnd, last_detected_time, last_fish_cy, last_bar_cy, prev_bar_cy
     global fish_lost_at, bar_lost_at, prev_diff, was_fishing, jitter_done
-    global prev_fish_cy, session_frames, last_known_progress, session_peak_progress
-    global session_in_zone_frames, session_visible_frames, bar_half_height
+    global prev_fish_cy, session_frames, bar_half_height
     global current_fish_rarity, current_speed_tier, _rarity_vote_buffer
     global est_pixel_gravity, est_pixel_player_speed, calibration_count
     global prev_hold_time, prev_bar_v, last_applied_hold, fight_start_time
@@ -550,10 +524,6 @@ def recapture_window():
     jitter_done = False
     prev_fish_cy = None
     session_frames = []
-    last_known_progress = 0.0
-    session_peak_progress = 0.0
-    session_in_zone_frames = 0
-    session_visible_frames = 0
     bar_half_height = None
     current_fish_rarity = "unknown"
     current_speed_tier = "medium"
@@ -655,9 +625,8 @@ while True:
                 if hsv_med is not None:
                     rarity, known = classify_fish_rarity(hsv_med)
                     _cname = _hue_name(int(hsv_med[0]), int(hsv_med[1]), int(hsv_med[2]))
-                    if DEBUG_COLOR_LOG:
-                        lock_tag = " [locked]" if current_fish_rarity != "unknown" else ""
-                        print(f"[COLOR] {rarity} | {_cname} (H={hsv_med[0]} S={hsv_med[1]} V={hsv_med[2]}){lock_tag}")
+                    if DEBUG_COLOR_LOG and current_fish_rarity == "unknown":
+                        print(f"[COLOR] {rarity} | {_cname} (H={hsv_med[0]} S={hsv_med[1]} V={hsv_med[2]})")
                     # Multi-frame voting: lock rarity once 2 of last 3 samples agree
                     if current_fish_rarity == "unknown":
                         if known:
@@ -714,12 +683,7 @@ while True:
             session_bar_min = last_bar_cy
         if session_bar_max is None or last_bar_cy > session_bar_max:
             session_bar_max = last_bar_cy
-        # Update progress bar tracking
-        progress = detect_progress_bar(full_frame, x_start, y_start, x_end, y_end)
-        if progress is not None:
-            last_known_progress = progress
-            if progress > session_peak_progress:
-                session_peak_progress = progress
+
 
     # Update and retain fish coordinates.
     if current_fish_cy_raw is not None:
@@ -828,9 +792,6 @@ while True:
                     # Catch zone check (generous overlap from game physics)
                     catch_zone_half = bh * CATCH_ZONE_FRACTION
                     in_catch_zone = abs(diff) < catch_zone_half
-                    session_visible_frames += 1
-                    if in_catch_zone:
-                        session_in_zone_frames += 1
 
                     if mpc_ready:
                         # --- MPC controller (Phase 3) ---
@@ -923,37 +884,18 @@ while True:
     elif current_time - last_detected_time > RECAST_INTERVAL:
         if was_fishing:
             sessions_total += 1
-            # Use peak session progress to avoid late-frame dropouts marking real catches as misses.
-            effective_progress = max(last_known_progress, session_peak_progress)
-            quality_ratio = (session_in_zone_frames / session_visible_frames) if session_visible_frames > 0 else 0.0
-            quality_caught = session_visible_frames >= QUALITY_MIN_FRAMES and quality_ratio >= QUALITY_CATCH_RATIO
-            caught = (effective_progress >= CAUGHT_THRESHOLD) or quality_caught
-            if caught:
-                fish_caught += 1
-            else:
-                fish_escaped += 1
-            outcome = "CATCH" if caught else "MISS"
             # --- Self-learning: update hold table from this session ---
             if len(session_frames) >= 5:
-                process_session_learning(session_frames, effective_progress, current_speed_tier, learned_data)
+                process_session_learning(session_frames, current_speed_tier, learned_data)
                 save_learned_data(learned_data, LEARN_FILE)
                 tier_d = learned_data["tiers"].get(current_speed_tier, {})
-                avg_q = tier_d.get("avg_quality", 0.0)
                 tier_sessions = tier_d.get("sessions", 1)
-                print(f"[{outcome}] Session #{sessions_total} | Progress: {effective_progress:.0%} (last {last_known_progress:.0%}, peak {session_peak_progress:.0%}) | "
-                      f"Q:{quality_ratio:.0%} ({session_in_zone_frames}/{session_visible_frames}) | "
-                      f"Rarity={current_fish_rarity} ({current_speed_tier}) | "
-                      f"{len(session_frames)} frames | Tier avg quality: {avg_q:.0%} over {tier_sessions}s")
+                print(f"[SESSION] #{sessions_total} | Rarity={current_fish_rarity} ({current_speed_tier}) | "
+                      f"{len(session_frames)} frames | Tier sessions: {tier_sessions}")
             else:
-                print(f"[{outcome}] Session #{sessions_total} | Progress: {effective_progress:.0%} (last {last_known_progress:.0%}, peak {session_peak_progress:.0%}) | "
-                      f"Q:{quality_ratio:.0%} ({session_in_zone_frames}/{session_visible_frames}) | "
-                      f"Rarity={current_fish_rarity} (insufficient frames, not learned)")
+                print(f"[SESSION] #{sessions_total} | Rarity={current_fish_rarity} (insufficient frames, not learned)")
             session_frames = []
             was_fishing = False
-            last_known_progress = 0.0
-            session_peak_progress = 0.0
-            session_in_zone_frames = 0
-            session_visible_frames = 0
             current_fish_rarity = "unknown"
             _rarity_vote_buffer[:] = []
             session_bar_min = None
@@ -977,7 +919,7 @@ while True:
         cv2.putText(full_frame, input_txt, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         cv2.putText(full_frame, debug_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         # Sessions counter + learning tier display
-        cv2.putText(full_frame, f"Sessions: {sessions_total}  C:{fish_caught} E:{fish_escaped}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 2)
+        cv2.putText(full_frame, f"Sessions: {sessions_total}", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (180, 180, 180), 2)
         rarity_color = RARITY_OVERLAY_COLORS.get(current_fish_rarity, (200, 200, 200))
         cv2.putText(full_frame, f"{current_fish_rarity} ({current_speed_tier})", (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.5, rarity_color, 2)
         tier_strs = [f"{tn[:3].upper()}:{learned_data['tiers'].get(tn, {}).get('sessions', 0)}s"
@@ -985,15 +927,7 @@ while True:
                      if learned_data["tiers"].get(tn, {}).get("sessions", 0) > 0]
         if tier_strs:
             cv2.putText(full_frame, " ".join(tier_strs), (10, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
-        # Progress bar mini-visualization
-        bar_x, bar_y_ov, bar_w_ov, bar_h_ov = w - 30, 30, 16, 100
-        cv2.rectangle(full_frame, (bar_x, bar_y_ov), (bar_x + bar_w_ov, bar_y_ov + bar_h_ov), (80, 80, 80), -1)
-        fill_h = int(bar_h_ov * last_known_progress)
-        if fill_h > 0:
-            fill_color = (0, 220, 0) if last_known_progress >= CAUGHT_THRESHOLD else (0, 180, 220)
-            cv2.rectangle(full_frame, (bar_x, bar_y_ov + bar_h_ov - fill_h), (bar_x + bar_w_ov, bar_y_ov + bar_h_ov), fill_color, -1)
-        cv2.rectangle(full_frame, (bar_x, bar_y_ov), (bar_x + bar_w_ov, bar_y_ov + bar_h_ov), (200, 200, 200), 1)
-        cv2.putText(full_frame, f"{last_known_progress:.0%}", (bar_x - 10, bar_y_ov + bar_h_ov + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (200, 200, 200), 1)
+
         cv2.imshow("AI Fishing (Full-Integrated)", cv2.resize(full_frame, (960, 540)))
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
